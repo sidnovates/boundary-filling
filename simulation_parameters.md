@@ -33,8 +33,15 @@ The obstacle is defined by three solid walls and an explicit open side on the bo
 ## 4. Simulation Behaviors
 - **Total Timesteps:** `1000`
 - **Random Walk Turn Probability:** `10%` (`0.1`) chance every timestep that a robot will instantly pick a completely new random direction.
-- **Wall Collisions:** Robots execute a ray-reflection style deterministic bounce when their physical radius overlaps a wall.
-- **Robot Collisions:** If the distance between two robot centers becomes less than twice their radius ($d \le 2R$, physically overlapping), they instantly bounce away by flipping their angle $180^\circ$ ($+π$). 
+- **Wall Collisions:** Handled dynamically via Artificial Potential Fields (APF).
+- **Robot Collisions:** Handled dynamically via Artificial Potential Fields (APF).
 
 ## 5. View Configuration (Playback)
 - **Animation Speed Interval:** `30 ms` duration per drawn frame. Wait time for matplotlib before updating locations.
+
+## 6. Collision Algorithm (Artificial Potential Fields)
+The simulation uses continuous APF physics to achieve smooth collision avoidance without hard bouncing.
+- **Robot Sensing Radius ($R_{robot}$):** `8.0` units (Distance from robot edge to another robot edge where repulsion starts).
+- **Wall Sensing Radius ($R_{wall}$):** `8.0` units (Distance from robot edge to wall where repulsion starts).
+- **Robot Repulsion Gain ($k_{rep}$):** `50.0` (Multiplier for force pushing robots apart).
+- **Wall Repulsion Gain ($k_{wall}$):** `50.0` (Multiplier for force pushing robots away from walls).

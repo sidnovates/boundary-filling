@@ -24,109 +24,134 @@ class Robot:
         self.radius = radius
         
         # Physics properties
-        self.speed = 1
+        self.speed = 0.7
         # Initialize with a random direction angle (in radians)
         self.angle = random.uniform(0, 2 * math.pi)
 
-    def check_wall_collision(self, next_x, next_y, walls):
-        """
-        Continuous collision detection against line segments considering physical radius.
-        """
-        for (x1, y1), (x2, y2) in walls:
-            # Vertical wall obstacle
-            if x1 == x2:
-                dist_next = abs(next_x - x1)
-                dist_curr = abs(self.position[0] - x1)
-                # Check if radius intersects the wall AND it is moving closer to it
-                if dist_next <= self.radius and dist_next < dist_curr:
-                    # Were we within the y-segment of the wall?
-                    y_min = min(y1, y2) - self.radius
-                    y_max = max(y1, y2) + self.radius
-                    if y_min <= self.position[1] <= y_max or y_min <= next_y <= y_max:
-                        return True, 'vertical'
-            
-            # Horizontal wall obstacle
-            elif y1 == y2:
-                dist_next = abs(next_y - y1)
-                dist_curr = abs(self.position[1] - y1)
-                # Check if radius intersects the wall AND it is moving closer to it
-                if dist_next <= self.radius and dist_next < dist_curr:
-                    # Were we within the x-segment of the wall?
-                    x_min = min(x1, x2) - self.radius
-                    x_max = max(x1, x2) + self.radius
-                    if x_min <= self.position[0] <= x_max or x_min <= next_x <= x_max:
-                        return True, 'horizontal'
-        return False, None
+        # APF (Artificial Potential Field) Parameters
+        self.R_robot_sense = 2.0   # Sensing radius for other robots
+        self.R_wall_sense = 10.0    # Sensing radius for walls
+        self.k_rep = 50.0          # Repulsion gain for robots
+        self.k_wall = 50.0         # Repulsion gain for walls
+
+    def _dist_to_segment(self, px, py, x1, y1, x2, y2):
+        """Helper to find shortest distance from point to line segment"""
+        dx = x2 - x1
+        dy = y2 - y1
+        l2 = dx*dx + dy*dy
+        if l2 == 0:
+            return math.hypot(px - x1, py - y1), x1, y1
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / l2))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return math.hypot(px - proj_x, py - proj_y), proj_x, proj_y
+
+    def compute_wall_repulsion(self, inner_walls):
+        f_wall = np.zeros(2)
         
-    def update(self, other_robots, inner_walls):
-        """
-        Updates the robot's position based on its speed and direction.
-        Handles random walk, boundary bouncing, obstacle, and robot collisions.
-        """
-        # Random Walk: With a small probability (e.g. 0.1), pick a new random direction
+        # Combine outer boundaries and inner walls
+        walls = [
+            (0, 0, self.env_width, 0),                           # Bottom
+            (0, self.env_height, self.env_width, self.env_height), # Top
+            (0, 0, 0, self.env_height),                          # Left
+            (self.env_width, 0, self.env_width, self.env_height)   # Right
+        ]
+        for w in inner_walls:
+            walls.append((w[0][0], w[0][1], w[1][0], w[1][1]))
+            
+        for x1, y1, x2, y2 in walls:
+            dist, px, py = self._dist_to_segment(self.position[0], self.position[1], x1, y1, x2, y2)
+            
+            # Effectively measure distance from the robot's physical shell
+            effective_dist = dist - self.radius
+            if effective_dist < 0.001:
+                effective_dist = 0.001
+                
+            if effective_dist < self.R_wall_sense:
+                # F_wall = k_wall * (1/d - 1/R_wall) * (1/d^2) * direction_away
+                magnitude = self.k_wall * (1.0/effective_dist - 1.0/self.R_wall_sense) * (1.0/(effective_dist**2))
+                
+                # Direction away from the wall projection point
+                dx = self.position[0] - px
+                dy = self.position[1] - py
+                if dist > 0.001:
+                    dx /= dist
+                    dy /= dist
+                else:
+                    dx, dy = random.uniform(-1, 1), random.uniform(-1, 1)
+                    
+                f_wall += np.array([dx, dy]) * magnitude
+                
+        return f_wall
+
+    def compute_robot_repulsion(self, other_robots):
+        f_rep = np.zeros(2)
+        for other in other_robots:
+            if other is self:
+                continue
+            
+            # Distance between centers
+            dist = math.hypot(self.position[0] - other.position[0], self.position[1] - other.position[1])
+            # Effective distance between robot shells
+            effective_dist = dist - (2 * self.radius)
+            
+            if effective_dist < 0.001:
+                effective_dist = 0.001
+                
+            if effective_dist < self.R_robot_sense:
+                # F_repulsion = k_rep * (1/d - 1/R_robot) * (1/d^2) * direction_away
+                magnitude = self.k_rep * (1.0/effective_dist - 1.0/self.R_robot_sense) * (1.0/(effective_dist**2))
+                
+                # Direction away from the other robot
+                dx = (self.position[0] - other.position[0]) / dist
+                dy = (self.position[1] - other.position[1]) / dist
+                
+                f_rep += np.array([dx, dy]) * magnitude
+                
+        return f_rep
+
+    def compute_total_force(self, other_robots, inner_walls):
+        # 1. Random Exploration Force (Maintain random walk behavior)
         if random.random() < 0.1:
             self.angle = random.uniform(0, 2 * math.pi)
-            
-        # Calculate proposed new position
-        new_x = self.position[0] + self.speed * math.cos(self.angle)
-        new_y = self.position[1] + self.speed * math.sin(self.angle)
+        f_random = np.array([math.cos(self.angle), math.sin(self.angle)]) * self.speed
         
-        bounced = False
-
-        # 1. Outer Environment Boundary Collision
-        if new_x - self.radius < 0:
-            new_x = self.radius
-            self.angle = math.pi - self.angle
-            bounced = True
-        elif new_x + self.radius > self.env_width:
-            new_x = self.env_width - self.radius
-            self.angle = math.pi - self.angle
-            bounced = True
-            
-        if new_y - self.radius < 0:
-            new_y = self.radius
-            self.angle = -self.angle
-            bounced = True
-        elif new_y + self.radius > self.env_height:
-            new_y = self.env_height - self.radius
-            self.angle = -self.angle
-            bounced = True
-
-        # 2. Inner Obstacle Collision Detection
-        if not bounced:
-            collided, wall_type = self.check_wall_collision(new_x, new_y, inner_walls)
-            if collided:
-                if wall_type == 'vertical':
-                    self.angle = math.pi - self.angle
-                elif wall_type == 'horizontal':
-                    self.angle = -self.angle
-                
-                # Step back to avoid getting stuck inside the wall
-                new_x = self.position[0]
-                new_y = self.position[1]
-                bounced = True
-
-        # 3. Simple Robot-to-Robot Collision
-        if not bounced:
-            for other in other_robots:
-                if other is not self:
-                    # Calculate new distance vs old distance
-                    dist_new = math.hypot(new_x - other.position[0], new_y - other.position[1])
-                    dist_old = math.hypot(self.position[0] - other.position[0], self.position[1] - other.position[1])
-                    
-                    if dist_new < 2 * self.radius and dist_new < dist_old:
-                        # Collision! Bounce away logically by turning around 180 degrees
-                        self.angle += math.pi
-                        
-                        # Step back to current valid position
-                        new_x = self.position[0]
-                        new_y = self.position[1]
-                        break
-
-        # Normalize angle to be within [0, 2*pi]
-        self.angle %= (2 * math.pi)
+        # 2. Robot Repulsion Force
+        f_robot = self.compute_robot_repulsion(other_robots)
         
-        # Update actual position
+        # 3. Wall Repulsion Force
+        f_wall = self.compute_wall_repulsion(inner_walls)
+        
+        return f_random + f_robot + f_wall
+
+    def update(self, other_robots, inner_walls):
+        """
+        Updates the robot's position using APF (Artificial Potential Field) algorithm.
+        """
+        # Calculate total combined force vector
+        f_total = self.compute_total_force(other_robots, inner_walls)
+        
+        # Normalize and clamp speed to maximum velocity (self.speed)
+        magnitude = np.linalg.norm(f_total)
+        clamped_speed = min(magnitude, self.speed)
+        
+        if magnitude > 0:
+            velocity = (f_total / magnitude) * clamped_speed
+        else:
+            velocity = np.zeros(2)
+            
+        # Update angle for visual consistency and logic
+        if magnitude > 0.001:
+            self.angle = math.atan2(velocity[1], velocity[0])
+            
+        # Move the robot
+        new_x = self.position[0] + velocity[0]
+        new_y = self.position[1] + velocity[1]
+        
+        # Fallback coordinate clamping just in case forces fail at corners
+        new_x = max(self.radius, min(self.env_width - self.radius, new_x))
+        new_y = max(self.radius, min(self.env_height - self.radius, new_y))
+        
         self.position[0] = new_x
         self.position[1] = new_y
 
