@@ -127,17 +127,17 @@ class Robot:
                 effective_dist = 0.001
 
             if effective_dist < self.R_wall_sense:
-                magnitude = self.k_wall * (1.0 / effective_dist - 1.0 / self.R_wall_sense) * (1.0 / (effective_dist ** 2))
+                magnitude = self.k_wall * (1.0 / effective_dist - 1.0 / self.R_wall_sense) * (1.0 / (effective_dist ** (3/2)))
 
-                dx = self.position[0] - proj_x
-                dy = self.position[1] - proj_y
                 if dist > 0.001:
-                    dx /= dist
-                    dy /= dist
+                    grad_rho = np.array([
+                        (self.position[0] - proj_x) / dist,
+                        (self.position[1] - proj_y) / dist
+                    ])
                 else:
-                    dx, dy = random.uniform(-1, 1), random.uniform(-1, 1)
+                    grad_rho = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
 
-                f_wall += np.array([dx, dy]) * magnitude
+                f_wall += magnitude * grad_rho
 
         return f_wall
 
@@ -154,15 +154,17 @@ class Robot:
                 effective_dist = 0.001
 
             if effective_dist < self.R_robot_sense:
-                magnitude = self.k_rep * (1.0 / effective_dist - 1.0 / self.R_robot_sense) * (1.0 / (effective_dist ** 2))
+                magnitude = self.k_rep * (1.0 / effective_dist - 1.0 / self.R_robot_sense) * (1.0 / (effective_dist ** (3/2)))
 
                 if dist > 0.001:
-                    dx = (self.position[0] - other.position[0]) / dist
-                    dy = (self.position[1] - other.position[1]) / dist
+                    grad_rho = np.array([
+                        (self.position[0] - other.position[0]) / dist,
+                        (self.position[1] - other.position[1]) / dist
+                    ])
                 else:
-                    dx, dy = random.uniform(-1, 1), random.uniform(-1, 1)
+                    grad_rho = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
 
-                f_rep += np.array([dx, dy]) * magnitude
+                f_rep += magnitude * grad_rho
 
         return f_rep
 
