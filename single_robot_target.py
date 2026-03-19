@@ -28,6 +28,9 @@ K_REP = 50.0  # Robot-robot repulsion gain
 K_WALL = 50.0  # Wall repulsion gain
 K_ATT = 0.15  # Attractive gain shaping how quickly attraction ramps with distance
 ATT_FORCE_MAX = 0.4  # Upper bound on attractive force magnitude for more natural motion
+ATT_NEAR_BOOST_RADIUS = 2.5  # Radius around target where point attraction gets a stronger boost
+ATT_NEAR_BOOST = 0.45  # Extra near-target attraction to prevent circling around the point
+ATT_TOTAL_MAX = 1.0  # Hard cap on total point-attraction magnitude (base + near boost)
 
 TARGET_WIDTH_MULTIPLE = 10  # Target/obstacle span as integer multiple of robot diameter
 TARGET_LINE_WIDTH = TARGET_WIDTH_MULTIPLE * ROBOT_DIAMETER  # Resulting target line width (units)
@@ -41,6 +44,13 @@ OBSTACLE_RIGHT_X = OBSTACLE_CENTER_X + TARGET_LINE_WIDTH / 2.0  # Right x-coordi
 TARGET_LINE = ((OBSTACLE_LEFT_X, OBSTACLE_BOTTOM_Y), (OBSTACLE_RIGHT_X, OBSTACLE_BOTTOM_Y))  # Open bottom side
 TARGET_POINT_X_OFFSET = 10.0  # Shift target point +X from left tip so it lies on the line, not on obstacle tip
 TARGET_POINT = (TARGET_LINE[0][0] + TARGET_POINT_X_OFFSET, TARGET_LINE[0][1])  # Endpoint-following target
+
+CUE_LINE_LENGTH = 14.0  # Length of perpendicular guide line leading into the target point
+CUE_LINE = ((TARGET_POINT[0], TARGET_POINT[1] - CUE_LINE_LENGTH), TARGET_POINT)  # Perpendicular cue (vertical)
+CUE_FORCE_MAX = 0.12  # Lesser attraction strength for cue guidance (weaker than point field)
+CUE_K_ATT = 0.25  # Cue-field gain shaping pull toward the guide line
+CUE_SENSE_RADIUS = 12.0  # Only apply cue attraction when robot is close to the cue line
+CUE_ACTIVATION_RADIUS = 30.0  # Activate cue field only when robot is reasonably near the target
 
 SPAWN_BEHIND_U_Y_OFFSET = 8.0  # Spawn offset above the U's closed horizontal top wall
 SPAWN_POINT = (OBSTACLE_CENTER_X, OBSTACLE_TOP_Y + SPAWN_BEHIND_U_Y_OFFSET)  # Spawn behind closed side of U
@@ -74,6 +84,13 @@ class Robot:
         self.k_wall = K_WALL
         self.k_att = K_ATT
         self.att_force_max = ATT_FORCE_MAX
+        self.att_near_boost_radius = ATT_NEAR_BOOST_RADIUS
+        self.att_near_boost = ATT_NEAR_BOOST
+        self.att_total_max = ATT_TOTAL_MAX
+        self.cue_force_max = CUE_FORCE_MAX
+        self.cue_k_att = CUE_K_ATT
+        self.cue_sense_radius = CUE_SENSE_RADIUS
+        self.cue_activation_radius = CUE_ACTIVATION_RADIUS
 
         self.target_approach_radius = TARGET_APPROACH_RADIUS
         self.target_stop_distance = TARGET_STOP_DISTANCE
@@ -153,17 +170,44 @@ class Robot:
         dx = target_point[0] - self.position[0]
         dy = target_point[1] - self.position[1]
         center_dist = math.hypot(dx, dy)
-        effective_dist = center_dist - self.radius
 
-        if effective_dist <= 0.001 or center_dist <= 0.001:
+        if center_dist <= 0.001:
             return np.zeros(2)
 
         ux = dx / center_dist
         uy = dy / center_dist
-        magnitude = self.att_force_max * math.tanh(self.k_att * effective_dist)
+        base_magnitude = self.att_force_max * math.tanh(self.k_att * center_dist)
+        near_ratio = max(0.0, 1.0 - center_dist / self.att_near_boost_radius)
+        near_magnitude = self.att_near_boost * near_ratio
+        magnitude = min(self.att_total_max, base_magnitude + near_magnitude)
         return np.array([ux, uy]) * magnitude
 
-    def compute_total_force(self, other_robots, inner_walls, target_point):
+    def compute_cue_line_attraction(self, cue_line, target_point):
+        target_center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+        if target_center_dist > self.cue_activation_radius:
+            return np.zeros(2)
+
+        dist_to_line, proj_x, proj_y = self._dist_to_segment(
+            self.position[0],
+            self.position[1],
+            cue_line[0][0],
+            cue_line[0][1],
+            cue_line[1][0],
+            cue_line[1][1],
+        )
+
+        if dist_to_line > self.cue_sense_radius:
+            return np.zeros(2)
+
+        if dist_to_line <= 0.001:
+            return np.zeros(2)
+
+        ux = (proj_x - self.position[0]) / dist_to_line
+        uy = (proj_y - self.position[1]) / dist_to_line
+        magnitude = self.cue_force_max * math.tanh(self.cue_k_att * dist_to_line)
+        return np.array([ux, uy]) * magnitude
+
+    def compute_total_force(self, other_robots, inner_walls, target_point, cue_line):
         center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
         approach_ratio = min(1.0, center_dist / self.target_approach_radius)
 
@@ -176,13 +220,14 @@ class Robot:
         wall_scale = self.near_target_wall_scale + (1.0 - self.near_target_wall_scale) * approach_ratio
         f_wall *= wall_scale
         f_target = self.compute_target_attraction(target_point)
+        f_cue = self.compute_cue_line_attraction(cue_line, target_point)
 
-        return f_random + f_robot + f_wall + f_target
+        return f_random + f_robot + f_wall + f_target + f_cue
 
-    def update(self, other_robots, inner_walls, target_point):
+    def update(self, other_robots, inner_walls, target_point, cue_line):
         center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
 
-        f_total = self.compute_total_force(other_robots, inner_walls, target_point)
+        f_total = self.compute_total_force(other_robots, inner_walls, target_point, cue_line)
 
         magnitude = np.linalg.norm(f_total)
         approach_speed_scale = min(1.0, center_dist / self.target_approach_radius)
@@ -225,6 +270,7 @@ class Environment:
 
         self.target_line = TARGET_LINE
         self.target_point = TARGET_POINT
+        self.cue_line = CUE_LINE
 
         self.robots = []
         for _ in range(num_robots):
@@ -237,7 +283,7 @@ class Environment:
 
     def step(self):
         for robot in self.robots:
-            robot.update(self.robots, self.inner_walls, self.target_point)
+            robot.update(self.robots, self.inner_walls, self.target_point, self.cue_line)
 
     def reached_target_point(self):
         return self.robots[0].has_reached_point(self.target_point)
@@ -270,6 +316,16 @@ def main():
         linestyle='--',
         linewidth=1.5,
         label='Target Line',
+    )
+
+    ax.plot(
+        [env.cue_line[0][0], env.cue_line[1][0]],
+        [env.cue_line[0][1], env.cue_line[1][1]],
+        color='green',
+        linewidth=7,
+        alpha=0.12,
+        zorder=1,
+        label='Cue Shadow',
     )
 
     ax.scatter([env.target_point[0]], [env.target_point[1]], color='green', s=40, zorder=4, label='Target Point')
