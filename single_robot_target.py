@@ -15,7 +15,7 @@ import math
 ENV_WIDTH = 100  # Total environment width (units)
 ENV_HEIGHT = 100  # Total environment height (units)
 
-NUM_ROBOTS = 1  # Keep exactly one robot in this phase
+NUM_ROBOTS = 10  # Spawn 4 robots
 
 ROBOT_RADIUS = 1.5  # Physical robot radius (units)
 ROBOT_DIAMETER = 2 * ROBOT_RADIUS  # Physical robot diameter (units)
@@ -24,9 +24,10 @@ TURN_PROBABILITY = 0.1  # Chance each step to randomize heading
 
 R_ROBOT_SENSE = 2.0  # Robot-robot repulsion sensing radius
 R_WALL_SENSE = 10.0  # Wall repulsion sensing radius
-K_REP = 50.0  # Robot-robot repulsion gain
-K_WALL = 50.0  # Wall repulsion gain
-K_ATT = 0.15  # Attractive gain shaping how quickly attraction ramps with distance
+K_REP = 20  # Robot-robot repulsion gain
+K_WALL = 5  # Wall repulsion gain
+K_TANGENT_SCALE = 2.0  # Multiplier for the tangential "sliding" force to skirt around walls
+K_ATT = 20  # Attractive gain shaping how quickly attraction ramps with distance
 ATT_FORCE_MAX = 0.4  # Upper bound on attractive force magnitude for more natural motion
 ATT_NEAR_BOOST_RADIUS = 2.5  # Radius around target where point attraction gets a stronger boost
 ATT_NEAR_BOOST = 0.45  # Extra near-target attraction to prevent circling around the point
@@ -45,10 +46,10 @@ TARGET_LINE = ((OBSTACLE_LEFT_X, OBSTACLE_BOTTOM_Y), (OBSTACLE_RIGHT_X, OBSTACLE
 TARGET_POINT_X_OFFSET = 10.0  # Shift target point +X from left tip so it lies on the line, not on obstacle tip
 TARGET_POINT = (TARGET_LINE[0][0] + TARGET_POINT_X_OFFSET, TARGET_LINE[0][1])  # Endpoint-following target
 
-CUE_LINE_LENGTH = 14.0  # Length of perpendicular guide line leading into the target point
+CUE_LINE_LENGTH = 0  # Length of perpendicular guide line leading into the target point
 CUE_LINE = ((TARGET_POINT[0], TARGET_POINT[1] - CUE_LINE_LENGTH), TARGET_POINT)  # Perpendicular cue (vertical)
-CUE_FORCE_MAX = 0.12  # Lesser attraction strength for cue guidance (weaker than point field)
-CUE_K_ATT = 0.25  # Cue-field gain shaping pull toward the guide line
+CUE_FORCE_MAX = 0  # Lesser attraction strength for cue guidance (weaker than point field)
+CUE_K_ATT = 0  # Cue-field gain shaping pull toward the guide line
 CUE_SENSE_RADIUS = 12.0  # Only apply cue attraction when robot is close to the cue line
 CUE_ACTIVATION_RADIUS = 30.0  # Activate cue field only when robot is reasonably near the target
 
@@ -82,6 +83,7 @@ class Robot:
         self.R_wall_sense = R_WALL_SENSE
         self.k_rep = K_REP
         self.k_wall = K_WALL
+        self.k_tangent_scale = K_TANGENT_SCALE
         self.k_att = K_ATT
         self.att_force_max = ATT_FORCE_MAX
         self.att_near_boost_radius = ATT_NEAR_BOOST_RADIUS
@@ -107,7 +109,7 @@ class Robot:
         proj_y = y1 + t * dy
         return math.hypot(px - proj_x, py - proj_y), proj_x, proj_y
 
-    def compute_wall_repulsion(self, inner_walls):
+    def compute_wall_repulsion(self, inner_walls, target_line):
         f_wall = np.zeros(2)
 
         walls = [
@@ -141,8 +143,12 @@ class Robot:
 
         return f_wall
 
-    def compute_robot_repulsion(self, other_robots):
+    def compute_robot_repulsion(self, other_robots, target_line):
         f_rep = np.zeros(2)
+        
+        tx = ((target_line[0][0] + target_line[1][0]) / 2.0) - self.position[0]
+        ty = ((target_line[0][1] + target_line[1][1]) / 2.0) - self.position[1]
+
         for other in other_robots:
             if other is self:
                 continue
@@ -153,8 +159,12 @@ class Robot:
             if effective_dist < 0.001:
                 effective_dist = 0.001
 
-            if effective_dist < self.R_robot_sense:
-                magnitude = self.k_rep * (1.0 / effective_dist - 1.0 / self.R_robot_sense) * (1.0 / (effective_dist ** (3/2)))
+            # Determine bubble size based on the OTHER robot's current sensing radius
+            # This allows finished robots to have a drastically collapsed force field
+            bubble_radius = other.R_robot_sense
+
+            if effective_dist < bubble_radius:
+                magnitude = self.k_rep * (1.0 / effective_dist - 1.0 / bubble_radius) * (1.0 / (effective_dist ** (3/2)))
 
                 if dist > 0.001:
                     grad_rho = np.array([
@@ -165,27 +175,45 @@ class Robot:
                     grad_rho = np.array([random.uniform(-1, 1), random.uniform(-1, 1)])
 
                 f_rep += magnitude * grad_rho
+                
+                # Add Tangential Force (Sliding around other robots)
+                t1 = np.array([-grad_rho[1], grad_rho[0]])
+                t2 = np.array([grad_rho[1], -grad_rho[0]])
+                
+                target_vector = np.array([tx, ty])
+                if np.dot(t1, target_vector) > np.dot(t2, target_vector):
+                    tangent = t1
+                else:
+                    tangent = t2
+                    
+                f_rep += magnitude * self.k_tangent_scale * tangent
 
         return f_rep
 
-    def compute_target_attraction(self, target_point):
-        dx = target_point[0] - self.position[0]
-        dy = target_point[1] - self.position[1]
-        center_dist = math.hypot(dx, dy)
+    def compute_target_line_attraction(self, target_line):
+        dist_to_line, proj_x, proj_y = self._dist_to_segment(
+            self.position[0], self.position[1],
+            target_line[0][0], target_line[0][1],
+            target_line[1][0], target_line[1][1]
+        )
 
-        if center_dist <= 0.001:
+        if dist_to_line <= 0.001:
             return np.zeros(2)
 
-        ux = dx / center_dist
-        uy = dy / center_dist
-        base_magnitude = self.att_force_max * math.tanh(self.k_att * center_dist)
-        near_ratio = max(0.0, 1.0 - center_dist / self.att_near_boost_radius)
+        ux = (proj_x - self.position[0]) / dist_to_line
+        uy = (proj_y - self.position[1]) / dist_to_line
+        base_magnitude = self.att_force_max * math.tanh(self.k_att * dist_to_line)
+        near_ratio = max(0.0, 1.0 - dist_to_line / self.att_near_boost_radius)
         near_magnitude = self.att_near_boost * near_ratio
         magnitude = min(self.att_total_max, base_magnitude + near_magnitude)
         return np.array([ux, uy]) * magnitude
 
-    def compute_cue_line_attraction(self, cue_line, target_point):
-        target_center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+    def compute_cue_line_attraction(self, cue_line, target_line):
+        target_center_dist, _, _ = self._dist_to_segment(
+            self.position[0], self.position[1],
+            target_line[0][0], target_line[0][1],
+            target_line[1][0], target_line[1][1]
+        )
         if target_center_dist > self.cue_activation_radius:
             return np.zeros(2)
 
@@ -209,27 +237,39 @@ class Robot:
         magnitude = self.cue_force_max * math.tanh(self.cue_k_att * dist_to_line)
         return np.array([ux, uy]) * magnitude
 
-    def compute_total_force(self, other_robots, inner_walls, target_point, cue_line):
-        center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+    def compute_total_force(self, other_robots, inner_walls, target_line, cue_line):
+        center_dist, _, _ = self._dist_to_segment(
+            self.position[0], self.position[1],
+            target_line[0][0], target_line[0][1],
+            target_line[1][0], target_line[1][1]
+        )
         approach_ratio = min(1.0, center_dist / self.target_approach_radius)
 
         if random.random() < self.turn_probability * approach_ratio:
             self.angle = random.uniform(0, 2 * math.pi)
         f_random = np.array([math.cos(self.angle), math.sin(self.angle)]) * self.speed * approach_ratio
 
-        f_robot = self.compute_robot_repulsion(other_robots)
-        f_wall = self.compute_wall_repulsion(inner_walls)
+        f_robot = self.compute_robot_repulsion(other_robots, target_line)
+        f_wall = self.compute_wall_repulsion(inner_walls, target_line)
         wall_scale = self.near_target_wall_scale + (1.0 - self.near_target_wall_scale) * approach_ratio
         f_wall *= wall_scale
-        f_target = self.compute_target_attraction(target_point)
-        f_cue = self.compute_cue_line_attraction(cue_line, target_point)
+        f_target = self.compute_target_line_attraction(target_line)
+        f_cue = self.compute_cue_line_attraction(cue_line, target_line)
 
         return f_random + f_robot + f_wall + f_target + f_cue
 
-    def update(self, other_robots, inner_walls, target_point, cue_line):
-        center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+    def update(self, other_robots, inner_walls, target_line, cue_line):
+        center_dist, _, _ = self._dist_to_segment(
+            self.position[0], self.position[1],
+            target_line[0][0], target_line[0][1],
+            target_line[1][0], target_line[1][1]
+        )
 
-        f_total = self.compute_total_force(other_robots, inner_walls, target_point, cue_line)
+        # Shrink the repulsive bubble if the robot has arrived at the target line
+        if self.has_reached_line(target_line):
+            self.R_robot_sense = 0.1
+
+        f_total = self.compute_total_force(other_robots, inner_walls, target_line, cue_line)
 
         magnitude = np.linalg.norm(f_total)
         approach_speed_scale = min(1.0, center_dist / self.target_approach_radius)
@@ -252,8 +292,13 @@ class Robot:
         self.position[0] = new_x
         self.position[1] = new_y
 
-    def has_reached_point(self, target_point):
-        return math.hypot(self.position[0] - target_point[0], self.position[1] - target_point[1]) <= self.target_stop_distance + TARGET_REACHED_EPS
+    def has_reached_line(self, target_line):
+        dist_to_line, _, _ = self._dist_to_segment(
+            self.position[0], self.position[1],
+            target_line[0][0], target_line[0][1],
+            target_line[1][0], target_line[1][1]
+        )
+        return dist_to_line <= self.target_stop_distance + TARGET_REACHED_EPS
 
 
 class Environment:
@@ -275,20 +320,21 @@ class Environment:
         self.cue_line = CUE_LINE
 
         self.robots = []
-        for _ in range(num_robots):
-            self.robots.append(self._spawn_single_robot())
+        for i in range(num_robots):
+            self.robots.append(self._spawn_robot(i, num_robots))
 
-    def _spawn_single_robot(self):
-        spawn_x = max(ROBOT_RADIUS, min(self.width - ROBOT_RADIUS, SPAWN_POINT[0]))
-        spawn_y = max(ROBOT_RADIUS, min(self.height - ROBOT_RADIUS, SPAWN_POINT[1]))
+    def _spawn_robot(self, index, total_robots):
+        spacing = self.width / (total_robots + 1)
+        spawn_x = spacing * (index + 1)
+        spawn_y = self.height - 10.0  # Top of the grid
         return Robot(spawn_x, spawn_y, self.width, self.height, radius=ROBOT_RADIUS)
 
     def step(self):
         for robot in self.robots:
-            robot.update(self.robots, self.inner_walls, self.target_point, self.cue_line)
+            robot.update(self.robots, self.inner_walls, self.target_line, self.cue_line)
 
-    def reached_target_point(self):
-        return self.robots[0].has_reached_point(self.target_point)
+    def reached_target_line(self):
+        return all(r.has_reached_line(self.target_line) for r in self.robots)
 
 
 def main():
@@ -302,7 +348,7 @@ def main():
     ax.set_xlim(0, ENV_WIDTH)
     ax.set_ylim(0, ENV_HEIGHT)
     ax.set_aspect('equal')
-    ax.set_title("Single Robot APF - Target Point Seeking")
+    ax.set_title("Multi-Robot APF - Line Seeking")
 
     ax.plot([0, ENV_WIDTH, ENV_WIDTH, 0, 0], [0, 0, ENV_HEIGHT, ENV_HEIGHT, 0], color='black', linewidth=1.5)
 
@@ -330,7 +376,7 @@ def main():
         label='Cue Shadow',
     )
 
-    ax.scatter([env.target_point[0]], [env.target_point[1]], color='green', s=40, zorder=4, label='Target Point')
+    # Target point removed since entire line is now attractive
 
     robot_area = 20
     scat = ax.scatter(
@@ -343,17 +389,20 @@ def main():
         zorder=3,
     )
 
-    radius_circle = plt.Circle(
-        (env.robots[0].position[0], env.robots[0].position[1]),
-        env.robots[0].radius,
-        color='blue',
-        fill=False,
-        linestyle='-',
-        linewidth=1,
-        alpha=0.5,
-        zorder=2,
-    )
-    ax.add_patch(radius_circle)
+    radius_circles = []
+    for r in env.robots:
+        circle = plt.Circle(
+            (r.position[0], r.position[1]),
+            r.radius,
+            color='blue',
+            fill=False,
+            linestyle='-',
+            linewidth=1,
+            alpha=0.5,
+            zorder=2,
+        )
+        ax.add_patch(circle)
+        radius_circles.append(circle)
 
     ax.legend(loc='upper right', fontsize='small')
 
@@ -365,16 +414,17 @@ def main():
 
         new_positions = np.c_[[r.position[0] for r in env.robots], [r.position[1] for r in env.robots]]
         scat.set_offsets(new_positions)
-        radius_circle.set_center((env.robots[0].position[0], env.robots[0].position[1]))
+        for circle, r in zip(radius_circles, env.robots):
+            circle.set_center((r.position[0], r.position[1]))
 
-        if env.reached_target_point():
-            print(f"Target point reached at timestep {state['timestep']}.")
-            ani.event_source.stop()
+        if env.reached_target_line():
+            print(f"All robots reached target line at timestep {state['timestep']}.")
+            plt.close(fig)
         elif state['timestep'] >= MAX_TIMESTEPS:
-            print(f"Stopped at max timesteps ({MAX_TIMESTEPS}) before reaching target point.")
-            ani.event_source.stop()
+            print(f"Stopped at max timesteps ({MAX_TIMESTEPS}) before reaching target line.")
+            plt.close(fig)
 
-        return [scat, radius_circle]
+        return [scat] + radius_circles
 
     ani = animation.FuncAnimation(
         fig,
