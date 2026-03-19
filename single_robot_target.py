@@ -39,8 +39,15 @@ OBSTACLE_LEFT_X = OBSTACLE_CENTER_X - TARGET_LINE_WIDTH / 2.0  # Left x-coordina
 OBSTACLE_RIGHT_X = OBSTACLE_CENTER_X + TARGET_LINE_WIDTH / 2.0  # Right x-coordinate of obstacle
 
 TARGET_LINE = ((OBSTACLE_LEFT_X, OBSTACLE_BOTTOM_Y), (OBSTACLE_RIGHT_X, OBSTACLE_BOTTOM_Y))  # Open bottom side
-TARGET_POINT_X_OFFSET = 2.0  # Shift target point +X from left tip so it lies on the line, not on obstacle tip
+TARGET_POINT_X_OFFSET = 10.0  # Shift target point +X from left tip so it lies on the line, not on obstacle tip
 TARGET_POINT = (TARGET_LINE[0][0] + TARGET_POINT_X_OFFSET, TARGET_LINE[0][1])  # Endpoint-following target
+
+SPAWN_BEHIND_U_Y_OFFSET = 8.0  # Spawn offset above the U's closed horizontal top wall
+SPAWN_POINT = (OBSTACLE_CENTER_X, OBSTACLE_TOP_Y + SPAWN_BEHIND_U_Y_OFFSET)  # Spawn behind closed side of U
+
+TARGET_APPROACH_RADIUS = 10.0  # Distance at which near-target smoothing starts
+TARGET_STOP_DISTANCE = 0.15  # Distance threshold to snap to target and stop
+NEAR_TARGET_WALL_SCALE = 0.25  # Minimum wall-repulsion scale near target to reduce jitter
 
 MAX_TIMESTEPS = 10000  # Safety cap to avoid infinite run
 ANIMATION_INTERVAL_MS = 30  # Milliseconds between frames
@@ -67,6 +74,10 @@ class Robot:
         self.k_wall = K_WALL
         self.k_att = K_ATT
         self.att_force_max = ATT_FORCE_MAX
+
+        self.target_approach_radius = TARGET_APPROACH_RADIUS
+        self.target_stop_distance = TARGET_STOP_DISTANCE
+        self.near_target_wall_scale = NEAR_TARGET_WALL_SCALE
 
     def _dist_to_segment(self, px, py, x1, y1, x2, y2):
         dx = x2 - x1
@@ -153,21 +164,29 @@ class Robot:
         return np.array([ux, uy]) * magnitude
 
     def compute_total_force(self, other_robots, inner_walls, target_point):
-        if random.random() < self.turn_probability:
+        center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+        approach_ratio = min(1.0, center_dist / self.target_approach_radius)
+
+        if random.random() < self.turn_probability * approach_ratio:
             self.angle = random.uniform(0, 2 * math.pi)
-        f_random = np.array([math.cos(self.angle), math.sin(self.angle)]) * self.speed
+        f_random = np.array([math.cos(self.angle), math.sin(self.angle)]) * self.speed * approach_ratio
 
         f_robot = self.compute_robot_repulsion(other_robots)
         f_wall = self.compute_wall_repulsion(inner_walls)
+        wall_scale = self.near_target_wall_scale + (1.0 - self.near_target_wall_scale) * approach_ratio
+        f_wall *= wall_scale
         f_target = self.compute_target_attraction(target_point)
 
         return f_random + f_robot + f_wall + f_target
 
     def update(self, other_robots, inner_walls, target_point):
+        center_dist = math.hypot(target_point[0] - self.position[0], target_point[1] - self.position[1])
+
         f_total = self.compute_total_force(other_robots, inner_walls, target_point)
 
         magnitude = np.linalg.norm(f_total)
-        clamped_speed = min(magnitude, self.speed)
+        approach_speed_scale = min(1.0, center_dist / self.target_approach_radius)
+        clamped_speed = min(magnitude, self.speed * approach_speed_scale)
 
         if magnitude > 0:
             velocity = (f_total / magnitude) * clamped_speed
@@ -187,7 +206,7 @@ class Robot:
         self.position[1] = new_y
 
     def has_reached_point(self, target_point):
-        return math.hypot(self.position[0] - target_point[0], self.position[1] - target_point[1]) <= self.radius + TARGET_REACHED_EPS
+        return math.hypot(self.position[0] - target_point[0], self.position[1] - target_point[1]) <= self.target_stop_distance + TARGET_REACHED_EPS
 
 
 class Environment:
@@ -212,17 +231,9 @@ class Environment:
             self.robots.append(self._spawn_single_robot())
 
     def _spawn_single_robot(self):
-        while True:
-            x = random.uniform(5, self.width - 5)
-            y = random.uniform(5, self.height - 5)
-
-            inside_obstacle = (
-                OBSTACLE_LEFT_X - ROBOT_RADIUS <= x <= OBSTACLE_RIGHT_X + ROBOT_RADIUS
-                and OBSTACLE_BOTTOM_Y - ROBOT_RADIUS <= y <= OBSTACLE_TOP_Y + ROBOT_RADIUS
-            )
-
-            if not inside_obstacle:
-                return Robot(x, y, self.width, self.height, radius=ROBOT_RADIUS)
+        spawn_x = max(ROBOT_RADIUS, min(self.width - ROBOT_RADIUS, SPAWN_POINT[0]))
+        spawn_y = max(ROBOT_RADIUS, min(self.height - ROBOT_RADIUS, SPAWN_POINT[1]))
+        return Robot(spawn_x, spawn_y, self.width, self.height, radius=ROBOT_RADIUS)
 
     def step(self):
         for robot in self.robots:
