@@ -15,11 +15,11 @@ import math
 ENV_WIDTH = 100  # Total environment width (units)
 ENV_HEIGHT = 100  # Total environment height (units)
 
-NUM_ROBOTS = 10  # Spawn 4 robots
+NUM_ROBOTS = 10 # Spawn 4 robots
 
 ROBOT_RADIUS = 1.5  # Physical robot radius (units)
 ROBOT_DIAMETER = 2 * ROBOT_RADIUS  # Physical robot diameter (units)
-ROBOT_SPEED = 2  # Max robot speed per timestep
+ROBOT_SPEED = 2 # Max robot speed per timestep
 TURN_PROBABILITY = 0.24  # Base chance each step to randomize heading
 
 R_ROBOT_SENSE = 2.0  # Robot-robot repulsion sensing radius
@@ -74,8 +74,13 @@ MAX_STEP_BACKOFF_ITERS = 10  # Max halving iterations for collision-safe step ba
 SAFETY_EPS = 1e-4  # Numerical safety epsilon for geometric checks
 
 MAX_TIMESTEPS = 10000  # Safety cap to avoid infinite run
-ANIMATION_INTERVAL_MS = 30  # Milliseconds between frames
+ANIMATION_INTERVAL_MS = 10  # Milliseconds between frames
 TARGET_REACHED_EPS = 1e-6  # Numerical tolerance for target-reached check
+
+# ====== Adaptive Bias Parameters ======
+K_ADAPTIVE_GAIN = 3.3      # Strength of the adaptive attraction boost
+CONFUSION_THRESHOLD = 2 # Trigger bias when net force magnitude < this value
+
 
 
 class Robot:
@@ -128,6 +133,7 @@ class Robot:
             "robot_repulsion": np.zeros(2),
             "wall_repulsion": np.zeros(2),
             "target_points": np.zeros(2),
+            "adaptive_bias": np.zeros(2),
             "total": np.zeros(2),
             "turn_probability": 0.0,
             "random_scale": 0.0,
@@ -364,13 +370,29 @@ class Robot:
             point_occupants,
             target_attenuation,
         )
-        f_total = f_random + f_robot + f_wall + f_target_points
+        
+        # Baseline forces
+        f_base = f_random + f_robot + f_wall + f_target_points
+        
+        # --- Adaptive Bias Logic ---
+        f_adaptive = np.zeros(2)
+        if np.linalg.norm(f_base) < CONFUSION_THRESHOLD:
+            # If "confused," provide a push towards the guidance point with a fixed-base magnitude
+            # This works even if the base target attraction is 0 (long-distance guidance)
+            goal_dir = np.array(guidance_point) - np.array(self.position)
+            dist = np.linalg.norm(goal_dir)
+            if dist > 0:
+                 # Use a normalized vector for consistent force regardless of distance
+                f_adaptive = (goal_dir / dist) * (self.att_force_max * 0.4) * K_ADAPTIVE_GAIN
+            
+        f_total = f_base + f_adaptive
 
         return {
             "random": f_random,
             "robot_repulsion": f_robot,
             "wall_repulsion": f_wall,
             "target_points": f_target_points,
+            "adaptive_bias": f_adaptive,
             "total": f_total,
             "turn_probability": turn_probability,
             "random_scale": random_scale,
@@ -387,6 +409,7 @@ class Robot:
                 "robot_repulsion": np.zeros(2),
                 "wall_repulsion": np.zeros(2),
                 "target_points": np.zeros(2),
+                "adaptive_bias": np.zeros(2),
                 "total": np.zeros(2),
                 "turn_probability": 0.0,
                 "random_scale": 0.0,
@@ -629,7 +652,8 @@ def main():
         robot_circles.append(circle)
 
     parked_proxy = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', alpha=0.85, markersize=8, linewidth=0)
-    ax.legend(handles=[parked_proxy], labels=['Robot'], loc='upper right', fontsize='small')
+    adaptive_proxy = plt.Line2D([0], [0], color='gold', linewidth=2.0, alpha=0.8)
+    ax.legend(handles=[parked_proxy, adaptive_proxy], labels=['Robot', 'Adaptive Bias'], loc='upper right', fontsize='small')
 
     state = {'timestep': 0}
     selected = {'index': None}
@@ -659,8 +683,12 @@ def main():
         "robot_repulsion": ax.plot([], [], color='cyan', linewidth=1.5, zorder=5, label='F_robot')[0],
         "wall_repulsion": ax.plot([], [], color='magenta', linewidth=1.5, zorder=5, label='F_wall')[0],
         "target_points": ax.plot([], [], color='green', linewidth=1.8, zorder=5, label='F_target')[0],
+        "adaptive_bias": ax.plot([], [], color='gold', linewidth=2.0, zorder=6, label='F_adaptive')[0],
         "total": ax.plot([], [], color='black', linewidth=2.0, zorder=6, label='F_total')[0],
     }
+
+    # "Always-on" adaptive bias lines for all robots (to see behavior without clicking)
+    adaptive_bias_lines = [ax.plot([], [], color='gold', linewidth=2.0, alpha=0.7, zorder=6)[0] for _ in env.robots]
 
     stats_text = ax.text(
         0.01,
@@ -713,12 +741,15 @@ def main():
         env.step()
         state['timestep'] += 1
 
-        for circle, r in zip(robot_circles, env.robots):
+        for i, (circle, r) in enumerate(zip(robot_circles, env.robots)):
             circle.set_center((r.position[0], r.position[1]))
             if r.parked:
                 circle.set_facecolor('navy')
             else:
                 circle.set_facecolor('blue')
+            
+            # Update the "always-on" adaptive bias line for this robot
+            _set_force_line(adaptive_bias_lines[i], r.position[0], r.position[1], r.last_force_components["adaptive_bias"])
 
         point_colors = ['gray' if occ else 'orange' for occ in env.target_point_occupied]
         target_point_scat.set_color(point_colors)
@@ -760,17 +791,19 @@ def main():
             _set_force_line(force_lines["robot_repulsion"], sx, sy, comp["robot_repulsion"])
             _set_force_line(force_lines["wall_repulsion"], sx, sy, comp["wall_repulsion"])
             _set_force_line(force_lines["target_points"], sx, sy, comp["target_points"])
+            _set_force_line(force_lines["adaptive_bias"], sx, sy, comp["adaptive_bias"])
             _set_force_line(force_lines["total"], sx, sy, comp["total"])
-
+            
+            adaptive_active = np.linalg.norm(comp["adaptive_bias"]) > 1e-6
             stats_text.set_text(
-                f"Robot #{selected['index']} | parked={sel.parked}\n"
+                f"Robot #{selected['index']} | parked={sel.parked} | Adaptive Bias: {'ON' if adaptive_active else 'OFF'}\n"
                 f"pos=({sx:.2f}, {sy:.2f}) vel=({sel.velocity[0]:.3f}, {sel.velocity[1]:.3f})\n"
                 f"R_robot_sense={sel.R_robot_sense:.2f}, R_wall_sense={sel.R_wall_sense:.2f}\n"
                 f"ATT_NEAR_BOOST_RADIUS={sel.att_near_boost_radius:.2f}, PARKED_REPULSE_RANGE={PARKED_POINT_REPULSE_RANGE:.2f}\n"
                 f"line_dist={comp['line_distance']:.2f}, target_attn={comp['target_attenuation']:.3f}\n"
                 f"|F_random|={np.linalg.norm(comp['random']):.3f}, |F_robot|={np.linalg.norm(comp['robot_repulsion']):.3f}\n"
                 f"|F_wall|={np.linalg.norm(comp['wall_repulsion']):.3f}, |F_target|={np.linalg.norm(comp['target_points']):.3f}\n"
-                f"|F_total|={np.linalg.norm(comp['total']):.3f}, turn_p={comp['turn_probability']:.3f}, rand_scale={comp['random_scale']:.3f}"
+                f"|F_adaptive|={np.linalg.norm(comp['adaptive_bias']):.3f}, |F_total|={np.linalg.norm(comp['total']):.3f}"
             )
 
         if env.reached_target_line():
@@ -788,6 +821,7 @@ def main():
             near_boost_circle,
             repulse_range_circle,
             *force_lines.values(),
+            *adaptive_bias_lines,
             stats_text,
             *robot_circles,
         ]
