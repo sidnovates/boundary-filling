@@ -19,7 +19,7 @@ NUM_ROBOTS = 10  # Spawn 4 robots
 
 ROBOT_RADIUS = 1.5  # Physical robot radius (units)
 ROBOT_DIAMETER = 2 * ROBOT_RADIUS  # Physical robot diameter (units)
-ROBOT_SPEED = 0.7  # Max robot speed per timestep
+ROBOT_SPEED =5  # Max robot speed per timestep
 TURN_PROBABILITY = 0.1  # Chance each step to randomize heading
 
 R_ROBOT_SENSE = 2.0  # Robot-robot repulsion sensing radius
