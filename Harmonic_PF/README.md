@@ -32,7 +32,11 @@ $$
 \mathbf{F}_{harmonic} = -k_h\nabla U
 $$
 
-and then clamped by `HARMONIC_FORCE_MAX`.
+with smooth saturation to avoid abrupt clipping:
+
+$$
+\|\mathbf{F}\|_{smooth}=F_{max}\tanh\left(\frac{\|\mathbf{F}_{raw}\|}{F_{max}}\right)
+$$
 
 ### 3. Discrete Laplace update (solver basis)
 
@@ -79,8 +83,19 @@ The following were introduced for the harmonic method in `multiRobots_HPF.py`:
 - `HARMONIC_WALL_THICKNESS`: rasterized wall thickness used when stamping obstacle segments onto the grid.
 - `HARMONIC_FORCE_GAIN`: gain converting gradient magnitude into guidance force magnitude.
 - `HARMONIC_FORCE_MAX`: hard cap on harmonic force magnitude before summation.
+- `HARMONIC_GRAD_SAMPLE_STEP`: finite-difference sampling step for smoother gradient estimates.
+- `HARMONIC_FORCE_SMOOTHING`: low-pass filter factor for harmonic force continuity.
+- `HARMONIC_ACCEL_LIMIT`: max change in robot velocity per step (jerk reduction).
+- `HARMONIC_VELOCITY_SMOOTHING` (pure script): blend factor between previous and desired velocity.
 - `HARMONIC_RECOMPUTE_ON_PARK`: when true, rebuilds the harmonic field after new parking events.
 - `HARMONIC_FIELD_ALPHA`: display transparency for the potential heatmap overlay.
+
+## Smoothness Fix (Conceptual)
+
+- The global navigation law remains harmonic: robots still follow $-\nabla U$.
+- Smooth force saturation replaces hard clipping to reduce sudden vector jumps.
+- Force low-pass filtering and acceleration-limited velocity updates are applied at the motion layer.
+- This preserves harmonic guidance conceptually while making trajectories physically smoother.
 
 ## What Changed vs Normal APF
 

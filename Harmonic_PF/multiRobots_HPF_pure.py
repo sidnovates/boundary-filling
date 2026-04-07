@@ -63,8 +63,14 @@ HARMONIC_GOAL_RADIUS = 0.9 * ROBOT_RADIUS
 HARMONIC_WALL_THICKNESS = ROBOT_RADIUS
 HARMONIC_FORCE_GAIN = 180.0
 HARMONIC_FORCE_MAX = 12.0
+HARMONIC_GRAD_SAMPLE_STEP = 0.6 * HARMONIC_CELL_SIZE
+HARMONIC_FORCE_SMOOTHING = 0.65
+HARMONIC_VELOCITY_SMOOTHING = 0.70
+HARMONIC_ACCEL_LIMIT = 0.55 * ROBOT_SPEED
 HARMONIC_RECOMPUTE_ON_PARK = True
 HARMONIC_FIELD_ALPHA = 0.24
+TARGET_APPROACH_RADIUS = 7.0
+MIN_APPROACH_SPEED_SCALE = 0.30
 
 
 class Robot:
@@ -76,8 +82,12 @@ class Robot:
 
         self.speed = ROBOT_SPEED
         self.angle = random.uniform(0.0, 2.0 * math.pi)
+        self.velocity_smoothing = HARMONIC_VELOCITY_SMOOTHING
+        self.max_accel = HARMONIC_ACCEL_LIMIT
+        self.harmonic_force_smoothing = HARMONIC_FORCE_SMOOTHING
 
         self.velocity = np.zeros(2)
+        self.prev_harmonic_force = np.zeros(2)
         self.parked = False
         self.parked_target_index = None
 
@@ -148,6 +158,7 @@ class Robot:
     def update(self, env):
         if self.parked:
             self.velocity = np.zeros(2)
+            self.prev_harmonic_force = np.zeros(2)
             self.last_force_components = {
                 "harmonic": np.zeros(2),
                 "total": np.zeros(2),
@@ -156,12 +167,26 @@ class Robot:
             }
             return
 
-        f_harmonic, harmonic_grad_norm, harmonic_potential = env.sample_harmonic_guidance(
+        center_dist, _, _ = self._dist_to_segment(
+            self.position[0],
+            self.position[1],
+            env.target_line[0][0],
+            env.target_line[0][1],
+            env.target_line[1][0],
+            env.target_line[1][1],
+        )
+
+        f_harmonic_raw, harmonic_grad_norm, harmonic_potential = env.sample_harmonic_guidance(
             self.position[0],
             self.position[1],
             HARMONIC_FORCE_GAIN,
             HARMONIC_FORCE_MAX,
         )
+        f_harmonic = (
+            self.harmonic_force_smoothing * self.prev_harmonic_force
+            + (1.0 - self.harmonic_force_smoothing) * f_harmonic_raw
+        )
+        self.prev_harmonic_force = f_harmonic
         f_total = f_harmonic
 
         self.last_force_components = {
@@ -172,12 +197,24 @@ class Robot:
         }
 
         magnitude = np.linalg.norm(f_total)
+        approach_speed_scale = max(MIN_APPROACH_SPEED_SCALE, min(1.0, center_dist / TARGET_APPROACH_RADIUS))
+        max_speed = self.speed * approach_speed_scale
         if magnitude > 1e-12:
-            desired_velocity = (f_total / magnitude) * min(magnitude, self.speed)
+            desired_velocity = (f_total / magnitude) * min(magnitude, max_speed)
         else:
             desired_velocity = np.zeros(2)
 
-        safe_step = self._safe_displacement(desired_velocity, env.robots, env.inner_walls)
+        blended_velocity = self.velocity_smoothing * self.velocity + (1.0 - self.velocity_smoothing) * desired_velocity
+        delta_v = blended_velocity - self.velocity
+        delta_v_norm = np.linalg.norm(delta_v)
+        if delta_v_norm > self.max_accel and delta_v_norm > 1e-12:
+            blended_velocity = self.velocity + (delta_v / delta_v_norm) * self.max_accel
+
+        speed = np.linalg.norm(blended_velocity)
+        if speed > max_speed and speed > 1e-12:
+            blended_velocity = (blended_velocity / speed) * max_speed
+
+        safe_step = self._safe_displacement(blended_velocity, env.robots, env.inner_walls)
         self.position[0] += safe_step[0]
         self.position[1] += safe_step[1]
         self.velocity = safe_step
@@ -273,12 +310,15 @@ class Environment:
 
     def sample_harmonic_guidance(self, x, y, gain, max_force):
         potential = float(self.harmonic_solver.sample_potential(x, y))
-        gradient = self.harmonic_solver.sample_gradient(x, y)
-        force = -float(gain) * gradient
+        gradient = self.harmonic_solver.sample_gradient(x, y, step=HARMONIC_GRAD_SAMPLE_STEP)
+        force_raw = -float(gain) * gradient
 
-        magnitude = float(np.linalg.norm(force))
-        if magnitude > max_force and magnitude > 1e-12:
-            force = force * (max_force / magnitude)
+        raw_mag = float(np.linalg.norm(force_raw))
+        if raw_mag > 1e-12:
+            smooth_mag = float(max_force) * math.tanh(raw_mag / max(1e-9, float(max_force)))
+            force = force_raw * (smooth_mag / raw_mag)
+        else:
+            force = np.zeros(2)
 
         return force, float(np.linalg.norm(gradient)), potential
 

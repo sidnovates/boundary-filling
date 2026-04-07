@@ -190,8 +190,8 @@ class HarmonicFieldSolver:
         v1 = (1.0 - tx) * v01 + tx * v11
         return (1.0 - ty) * v0 + ty * v1
 
-    def sample_gradient(self, x, y):
-        h = self.cell_size
+    def sample_gradient(self, x, y, step=None):
+        h = self.cell_size if step is None else max(1e-6, float(step))
 
         x_plus = min(self.width, float(x) + h)
         x_minus = max(0.0, float(x) - h)
