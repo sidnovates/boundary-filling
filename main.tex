@@ -1,0 +1,432 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{siunitx}
+\usepackage{enumitem}
+
+\title{Boundary Filling with Multi-Robot Potential-Field Methods\\Conceptual and Implementation Report}
+\author{Robotics Course Project Report}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report compiles and explains the three boundary-filling methods implemented in the project for a multi-robot swarm operating in a 2D environment with a U-shaped obstacle:
+(1) baseline Artificial Potential Field (APF),
+(2) APF with adaptive bias,
+and (3) Harmonic Potential Field (HPF)-guided control.
+The document presents full problem formulation, force equations, implementation-level constraints, parameter definitions, and a direct comparison table.
+\end{abstract}
+
+\section{Problem Formulation}
+
+\subsection{Task}
+A swarm of robots must fill discrete points along the open edge of a U-shaped boundary (target line) while avoiding:
+\begin{itemize}[leftmargin=1.2em]
+    \item world boundaries,
+    \item U-obstacle walls,
+    \item other robots.
+\end{itemize}
+A robot is parked once it claims a free target point. The process ends when all target points are occupied (or all robots are parked).
+
+\subsection{Environment and Geometry}
+All three methods share the same base geometry:
+\begin{itemize}[leftmargin=1.2em]
+    \item Workspace: $W=100$, $H=100$ units.
+    \item Robot count: $N=10$.
+    \item Robot radius: $r=1.5$; diameter: $d=2r=3.0$.
+    \item U-obstacle coordinates: left wall $(35,40)\rightarrow(35,80)$, right wall $(65,40)\rightarrow(65,80)$, top wall $(35,80)\rightarrow(65,80)$.
+    \item Target line (open bottom edge): $(35,40)\rightarrow(65,40)$.
+\end{itemize}
+
+Target points are sampled along the target line with spacing $d$:
+\begin{equation}
+    x_i = x_{\min} + i\,d, \quad y_i = 40,
+\end{equation}
+where $x_{\min}=35+r$ and $x_{\max}=65-r$.
+
+\subsection{Common Kinematic and Safety Constraints}
+At each step, a proposed displacement is accepted only if it is collision-safe. Otherwise, it is iteratively halved up to \texttt{MAX\_STEP\_BACKOFF\_ITERS}=10:
+\begin{equation}
+    \Delta p \leftarrow \frac{1}{2}\Delta p \quad \text{until valid or exhausted.}
+\end{equation}
+A state is valid if:
+\begin{align}
+    r \le x \le W-r, \qquad r \le y \le H-r, \\
+    \text{dist}(p, \text{any wall segment}) \ge r, \\
+    \|p_i-p_j\| \ge r_i+r_j \ \forall j\neq i.
+\end{align}
+
+Parking constraint for target point $k$:
+\begin{equation}
+    \|p_i - p_k\| \le d_{park}, \quad d_{park}=1.0,
+\end{equation}
+and no overlap with other robots at that point.
+
+\section{Shared Mathematical Building Blocks}
+
+\subsection{Point-to-Segment Distance}
+Used for wall distance and line distance:
+\begin{equation}
+    t=\mathrm{clip}\left(\frac{(p-a)\cdot(b-a)}{\|b-a\|^2},0,1\right),\quad p_{proj}=a+t(b-a),\quad \rho=\|p-p_{proj}\|.
+\end{equation}
+
+\subsection{Robot-Robot Repulsion with Tangential Sliding}
+For robot pair $(i,j)$:
+\begin{equation}
+    \rho_{eff}=\max\left(\|p_i-p_j\|-(r_i+r_j),10^{-3}\right).
+\end{equation}
+If $\rho_{eff}<R_{robot}$, repulsion magnitude is:
+\begin{equation}
+    m_{rep}=K_{rep}\left(\frac{1}{\rho_{eff}}-\frac{1}{R_{robot}}\right)\frac{1}{\rho_{eff}^{3/2}}.
+\end{equation}
+Normal repulsion is $m_{rep}\,\hat g$ where $\hat g=(p_i-p_j)/\|p_i-p_j\|$.
+Tangential candidates are:
+\begin{equation}
+    t_1=[-\hat g_y,\hat g_x],\quad t_2=[\hat g_y,-\hat g_x].
+\end{equation}
+The tangent with better dot product toward the guidance vector is selected (with hysteresis), then:
+\begin{equation}
+    F_{tan}=m_{rep}\,K_{tan}\,t_{chosen}.
+\end{equation}
+
+\subsection{Wall Repulsion}
+For distance $\rho$ from robot center to a wall segment:
+\begin{equation}
+    \rho_{eff}=\max(\rho-r,10^{-3}).
+\end{equation}
+If $\rho_{eff}<R_{wall}$:
+\begin{equation}
+    m_{wall}=K_{wall}\left(\frac{1}{\rho_{eff}}-\frac{1}{R_{wall}}\right)\frac{1}{\rho_{eff}^{3/2}},
+\end{equation}
+and $F_{wall}=m_{wall}\,\hat n$ with outward unit normal $\hat n$.
+Near the target line, wall force is softened:
+\begin{equation}
+    F_{wall}\leftarrow \lambda_{wall}F_{wall},\quad
+    \lambda_{wall}=\lambda_{min}+(1-\lambda_{min})\,\mathrm{approachRatio},\quad
+    \lambda_{min}=0.30.
+\end{equation}
+
+\subsection{Motion Update}
+All methods use velocity blending:
+\begin{equation}
+    v_{blend}=\alpha v_{prev} + (1-\alpha)v_{des},\quad \alpha=0.65 \text{ (APF/hybrid HPF)}.
+\end{equation}
+Velocity is clamped by speed and passed through safe-displacement checks.
+
+\section{Method 1: Baseline APF for Boundary Filling}
+\textbf{Implementation file:} \texttt{FirstTimeLinedUp\_APF/multiRobots\_APF.py}
+
+\subsection{Control Composition}
+Baseline APF total force:
+\begin{equation}
+    F_{total}=F_{random}+F_{robot}+F_{wall}+F_{targetPoints}.
+\end{equation}
+
+\subsection{Random Exploration and Target-Proximity Attenuation}
+Distance to target line is $d_{line}$. Define:
+\begin{equation}
+    \mathrm{approachRatio}=\min\left(1,\frac{d_{line}}{R_{approach}}\right),\quad R_{approach}=7.0.
+\end{equation}
+Random scaling:
+\begin{equation}
+    \mathrm{randomRatio}=\rho_{floor}+(1-\rho_{floor})\,\mathrm{approachRatio},\quad \rho_{floor}=0.1.
+\end{equation}
+Turn probability is reduced near line:
+\begin{equation}
+    P_{turn}=\min\left(0.95, P_0\,\mathrm{randomRatio}\right),\quad P_0=0.24.
+\end{equation}
+Random force:
+\begin{equation}
+    F_{random}=s\,[\cos\theta,\sin\theta],\quad s=\texttt{ROBOT\_SPEED}\times\mathrm{randomScale}.
+\end{equation}
+
+\subsection{Target-Point Attraction Field}
+For each target point $k$:
+\begin{align}
+    F^{(k)}_{base} &= A_{max}\tanh(K_{att}d_k), \\
+    F^{(k)}_{near} &= A_{near}\max\left(0,1-\frac{d_k}{R_{near}}\right), \\
+    g_k &= 1 + K_{left}w_k, \\
+    F^{(k)}_{mag} &= \min\left(A_{tot},(F^{(k)}_{base}+F^{(k)}_{near})g_k\right).
+\end{align}
+Typical values: $A_{max}=15$, $K_{att}=10$, $A_{near}=0.8$, $R_{near}=1.5$, $A_{tot}=12$, $K_{left}=1.5$.
+
+Target attraction attenuation based on line distance:
+\begin{equation}
+\gamma(d_{line})=
+\begin{cases}
+1, & d_{line}\le d_{full} \\
+0, & d_{line}\ge d_{zero} \\
+1-\mathrm{smoothstep}\!\left(\frac{d_{line}-d_{full}}{d_{zero}-d_{full}}\right), & \text{otherwise}
+\end{cases}
+\end{equation}
+with $d_{full}=5.0$, $d_{zero}=10.0$.
+
+\subsection{Occupied Target Point Handling}
+Occupied points generate local repulsion (except for self-occupied point) within radius:
+\begin{equation}
+    R_{occ}=0.9d=2.7,
+\end{equation}
+scaled by \texttt{PARKED\_POINT\_REPULSE\_SCALE}=0.9.
+This avoids multiple robots collapsing into the same slot and helps line packing.
+
+\subsection{Guidance Point Selection}
+Among uncovered target points, the selected guidance point minimizes weighted distance:
+\begin{equation}
+    k^*=\arg\min_k \frac{\|p_i-p_k\|}{\max(0.1,1+w_k)}.
+\end{equation}
+Here, $w_k$ is the point weight profile (edge points receive larger weight in this implementation).
+
+\subsection{Behavior Summary}
+Baseline APF is reactive, lightweight, and interpretable. However, when force terms cancel each other in cluttered regions, robots can slow significantly or exhibit indecision.
+
+\section{Method 2: APF with Adaptive Bias}
+\textbf{Implementation file:} \texttt{APF\_WithBiasPF/multiRobots\_APF\_WithAdaptiveBias.py}
+
+\subsection{Key Idea}
+Keep all baseline APF terms and inject an additional directional bias only when a robot appears locally confused (low net force magnitude).
+
+\subsection{Control Law}
+First compute baseline force:
+\begin{equation}
+    F_{base}=F_{random}+F_{robot}+F_{wall}+F_{targetPoints}.
+\end{equation}
+If
+\begin{equation}
+    \|F_{base}\|<\tau_c,
+\end{equation}
+with confusion threshold $\tau_c=2.0$, then apply:
+\begin{equation}
+    F_{adaptive}=K_{adapt}\,(0.4A_{max})\,\frac{p_{guide}-p_i}{\|p_{guide}-p_i\|},
+\end{equation}
+where $K_{adapt}=3.3$.
+Hence total force becomes:
+\begin{equation}
+    F_{total}=F_{base}+F_{adaptive}.
+\end{equation}
+When $\|F_{base}\|\ge\tau_c$, $F_{adaptive}=0$.
+
+\subsection{Why It Helps}
+In local stalemate zones, APF terms can partially cancel. The adaptive term acts as a conditional tie-breaker toward an uncovered guidance point, improving progression while preserving baseline behavior outside confusion regions.
+
+\subsection{Additional Parameters}
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{K\_ADAPTIVE\_GAIN}=3.3
+    \item \texttt{CONFUSION\_THRESHOLD}=2.0
+\end{itemize}
+All other APF mechanics and safety constraints remain unchanged from Method 1.
+
+\section{Method 3: Harmonic Potential Field Guidance}
+\textbf{Main implementation file:} \texttt{Harmonic\_PF/multiRobots\_HPF.py}
+
+\subsection{Conceptual Shift}
+Unlike APF (which computes target attraction from local analytic terms), HPF computes a global scalar potential $U(x,y)$ over the map by solving Laplace's equation with Dirichlet boundary conditions:
+\begin{equation}
+    \nabla^2 U = 0.
+\end{equation}
+
+\subsection{Boundary Conditions Used}
+\begin{itemize}[leftmargin=1.2em]
+    \item Outer map boundaries: $U=1.0$.
+    \item U-obstacle wall cells: $U=1.0$.
+    \item Active uncovered target points: $U=0.0$ (goal basins).
+\end{itemize}
+Goal points are rasterized with radius $0.9r$ and walls with thickness $r$.
+
+\subsection{Discrete Solver}
+The grid solver (\texttt{harmonic\_field\_solver.py}) uses Successive Over-Relaxation (SOR):
+\begin{equation}
+    U^{new}_{i,j}=(1-\omega)U^{old}_{i,j} + \omega\,\frac{U_{i+1,j}+U_{i-1,j}+U_{i,j+1}+U_{i,j-1}}{4},
+\end{equation}
+with $\omega=1.85$, max iterations 1500, tolerance $2\times10^{-4}$.
+
+\subsection{Guidance Force from Harmonic Field}
+Gradient is sampled by finite differences:
+\begin{equation}
+    \nabla U \approx \left[\frac{U(x+h,y)-U(x-h,y)}{2h},\frac{U(x,y+h)-U(x,y-h)}{2h}\right],
+\end{equation}
+with $h=0.6\times\texttt{cell\_size}$.
+
+Raw guidance:
+\begin{equation}
+    F_{raw}=-K_h\nabla U,\quad K_h=180.
+\end{equation}
+Smooth saturation:
+\begin{equation}
+    \|F\|_{smooth}=F_{max}\tanh\left(\frac{\|F_{raw}\|}{F_{max}}\right),\quad F_{max}=12.
+\end{equation}
+Then harmonic force is temporally low-pass filtered:
+\begin{equation}
+    F_{harm}=\beta F_{harm}^{prev}+(1-\beta)F_{raw,sat},\quad \beta=0.65.
+\end{equation}
+
+\subsection{Hybrid Force Composition in Implemented HPF Script}
+The deployed HPF script is hybrid (not pure harmonic-only):
+\begin{equation}
+    F_{total}=F_{random}+F_{robot}+F_{wall}+F_{harm}+F_{parkedPoints}.
+\end{equation}
+Additionally, acceleration is limited:
+\begin{equation}
+    \|\Delta v\|\le a_{max},\quad a_{max}=0.55\times\texttt{ROBOT\_SPEED}.
+\end{equation}
+
+\subsection{Dynamic Field Rebuild}
+After parking changes occupancy, the harmonic field can be recomputed (enabled):
+\begin{equation}
+    \texttt{HARMONIC\_RECOMPUTE\_ON\_PARK}=\texttt{True}.
+\end{equation}
+This updates goal basins to uncovered points only, improving global guidance consistency during progressive line filling.
+
+\subsection{Note on Pure HPF Variant}
+A pure control ablation also exists in \texttt{Harmonic\_PF/multiRobots\_HPF\_pure.py}, where:
+\begin{equation}
+    F_{total}=F_{harmonic}
+\end{equation}
+(excluding random/APF local terms), while preserving the same parking and collision-safe displacement checks.
+
+\section{Parameter and Constraint Reference}
+
+\subsection{Common Parameters Across the Three Main Methods}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.28\textwidth} >{\raggedright\arraybackslash}p{0.45\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} & \textbf{Value} \\
+\midrule
+\endhead
+\texttt{ENV\_WIDTH}, \texttt{ENV\_HEIGHT} & Workspace dimensions & 100, 100 \\
+\texttt{NUM\_ROBOTS} & Number of robots & 10 \\
+\texttt{ROBOT\_RADIUS}, \texttt{ROBOT\_DIAMETER} & Robot geometry & 1.5, 3.0 \\
+\texttt{TARGET\_WIDTH\_MULTIPLE} & Target width in diameters & 10 \\
+\texttt{TARGET\_LINE\_WIDTH} & Actual target line width & 30 \\
+\texttt{TARGET\_POINT\_SPACING} & Point-to-point spacing on line & 3.0 \\
+\texttt{R\_ROBOT\_SENSE} & Robot repulsion sensing distance & 2.0 \\
+\texttt{R\_WALL\_SENSE} & Wall repulsion sensing distance & 2.0 \\
+\texttt{K\_REP}, \texttt{K\_WALL} & Robot and wall repulsion gains & 18, 2 \\
+\texttt{K\_TANGENT\_SCALE} & Tangential sliding gain & 0.9 \\
+\texttt{TANGENT\_HYSTERESIS} & Tangential direction memory threshold & 0.3 \\
+\texttt{TARGET\_APPROACH\_RADIUS} & Distance scale for near-target behavior & 7.0 \\
+\texttt{NEAR\_TARGET\_WALL\_SCALE} & Min wall scaling near target line & 0.30 \\
+\texttt{VELOCITY\_SMOOTHING} & Velocity blending factor & 0.65 \\
+\texttt{PARK\_DISTANCE\_THRESHOLD} & Max distance to claim point & 1.0 \\
+\texttt{MAX\_STEP\_BACKOFF\_ITERS} & Safe-step halving attempts & 10 \\
+\texttt{SAFETY\_EPS} & Numerical robustness threshold & $10^{-4}$ \\
+\texttt{MAX\_TIMESTEPS} & Simulation stop cap & 10000 \\
+\bottomrule
+\end{longtable}
+
+\subsection{APF-Specific Parameters (Methods 1 and 2)}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.32\textwidth} >{\raggedright\arraybackslash}p{0.28\textwidth} >{\raggedright\arraybackslash}p{0.3\textwidth}}
+\toprule
+\textbf{Parameter} & \textbf{Meaning} & \textbf{Value} \\
+\midrule
+\endhead
+\texttt{K\_ATT} & Attraction curvature gain & 10 \\
+\texttt{ATT\_FORCE\_MAX} & Base attraction cap & 15 \\
+\texttt{ATT\_NEAR\_BOOST\_RADIUS} & Radius for near-target boost & 1.5 \\
+\texttt{ATT\_NEAR\_BOOST} & Near-target additive boost & 0.8 \\
+\texttt{ATT\_TOTAL\_MAX} & Final target-force cap & 12 \\
+\texttt{ATT\_LEFT\_GRADIENT\_GAIN} & Point-weight multiplier gain & 1.5 \\
+\texttt{PARKED\_POINT\_REPULSE\_SCALE} & Occupied point repulsion scaling & 0.9 \\
+\texttt{PARKED\_POINT\_REPULSE\_RANGE} & Occupied point repulsion range & 2.7 \\
+\texttt{TURN\_PROBABILITY} & Heading randomization probability & 0.24 \\
+\texttt{RANDOM\_FORCE\_SCALE} & Base random force scale & 1.0 \\
+\texttt{RANDOM\_FORCE\_MAX\_SCALE} & Max random scaling & 10 \\
+\texttt{RANDOM\_NEAR\_LINE\_FLOOR} & Minimum random ratio near line & 0.1 \\
+\texttt{TARGET\_ATTRACTION\_FULL\_DISTANCE} & Full attraction boundary & 5.0 \\
+\texttt{TARGET\_ATTRACTION\_ZERO\_DISTANCE} & Zero attraction boundary & 10.0 \\
+\bottomrule
+\end{longtable}
+
+\subsection{Adaptive-Bias Extra Parameters (Method 2 Only)}
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{K\_ADAPTIVE\_GAIN}=3.3
+    \item \texttt{CONFUSION\_THRESHOLD}=2.0
+\end{itemize}
+
+\subsection{Harmonic-Solver Parameters (Method 3)}
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.35\textwidth} >{\raggedright\arraybackslash}p{0.55\textwidth}}
+\toprule
+\textbf{Parameter} & \textbf{Value / Role} \\
+\midrule
+\endhead
+\texttt{HARMONIC\_CELL\_SIZE} & 1.0 (grid resolution in world units) \\
+\texttt{HARMONIC\_MAX\_ITERS} & 1500 (max SOR iterations per solve) \\
+\texttt{HARMONIC\_TOL} & $2\times10^{-4}$ (residual tolerance) \\
+\texttt{HARMONIC\_SOR\_OMEGA} & 1.85 (SOR relaxation factor) \\
+\texttt{HARMONIC\_WALL\_VALUE} & 1.0 (Dirichlet value on walls/boundary) \\
+\texttt{HARMONIC\_GOAL\_VALUE} & 0.0 (Dirichlet value at active goals) \\
+\texttt{HARMONIC\_GOAL\_RADIUS} & $0.9r$ (goal rasterization radius) \\
+\texttt{HARMONIC\_WALL\_THICKNESS} & $r$ (wall rasterization thickness) \\
+\texttt{HARMONIC\_FORCE\_GAIN} & 180.0 (gain for $-\nabla U$ guidance) \\
+\texttt{HARMONIC\_FORCE\_MAX} & 12.0 (smooth saturation limit) \\
+\texttt{HARMONIC\_GRAD\_SAMPLE\_STEP} & $0.6\times$cell size (finite-difference step) \\
+\texttt{HARMONIC\_FORCE\_SMOOTHING} & 0.65 (temporal filtering of harmonic force) \\
+\texttt{HARMONIC\_ACCEL\_LIMIT} & $0.55\times$ robot speed (max per-step velocity change) \\
+\texttt{HARMONIC\_RECOMPUTE\_ON\_PARK} & \texttt{True} (rebuild field when occupancy changes) \\
+\bottomrule
+\end{longtable}
+
+\section{Implementation Complexity and Practical Behavior}
+
+\subsection{Complexity Snapshot}
+Let $N$ be robot count, $W$ wall segments, $P$ target points, $G$ grid cells, and $I$ solver iterations.
+
+\begin{itemize}[leftmargin=1.2em]
+    \item Baseline APF: approximately $\mathcal{O}(N^2 + NW + NP)$ per timestep.
+    \item APF + adaptive bias: same as baseline plus $\mathcal{O}(1)$ condition and extra vector.
+    \item Harmonic HPF (hybrid): APF-like local step cost plus field solves $\mathcal{O}(GI)$ at initialization and after occupancy-triggered rebuilds.
+\end{itemize}
+
+\subsection{Observed Trade-Offs from Design}
+\begin{itemize}[leftmargin=1.2em]
+    \item APF is computationally cheaper and fully local but can suffer indecision in force-cancellation regions.
+    \item Adaptive bias improves deadlock escape with minimal overhead and no PDE solve.
+    \item Harmonic guidance improves global flow around concave obstacles by shaping a global potential landscape, at the cost of solve-time overhead and tuning of grid/solver parameters.
+\end{itemize}
+
+\section{Comparison Table}
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{0.21\textwidth} p{0.23\textwidth} p{0.23\textwidth} p{0.25\textwidth}}
+\toprule
+\textbf{Criterion} & \textbf{Method 1: Baseline APF} & \textbf{Method 2: APF + Adaptive Bias} & \textbf{Method 3: Harmonic PF (Hybrid)} \\
+\midrule
+Primary global guidance & Local target-point attraction & Same as APF + conditional bias toward guidance point & Global field from $-\nabla U$ \\
+Extra anti-stall mechanism & Tangential sliding + randomness & Tangential sliding + randomness + confusion-triggered bias & Harmonic global flow + local terms \\
+Risk of local indecision & Moderate in clutter/force balance & Reduced versus baseline & Lower for global routing, but still depends on local interactions \\
+Computational load & Low & Low (slightly above APF) & Highest (requires PDE solve/rebuild) \\
+Map awareness & Local/reactive & Local/reactive with directed assist & Global (through solved potential) \\
+Implementation complexity & Moderate & Moderate+ (small extension) & High (solver + hybrid integration) \\
+Suitability for static known map & Good & Very good & Excellent \\
+Real-time scalability (limited CPU) & Strong & Strong & Moderate (depends on grid/iterations) \\
+\bottomrule
+\end{tabular}
+\caption{Conceptual and implementation-level comparison of the three boundary-filling methods.}
+\end{table}
+
+\section{Conclusion}
+The project demonstrates a clear methodological progression:
+\begin{enumerate}[leftmargin=1.2em]
+    \item baseline APF establishes reactive boundary filling with strong local safety behavior,
+    \item adaptive-bias APF addresses low-force indecision with minimal structural change,
+    \item harmonic PF introduces global navigation structure and smoother obstacle-aware guidance.
+\end{enumerate}
+For this boundary-filling problem with a fixed U-shaped obstacle, the harmonic method provides the strongest global guidance quality, while adaptive APF remains an attractive low-cost alternative when solver overhead must be minimized.
+
+\section*{Reproducibility Notes}
+Main scripts used for this report:
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{FirstTimeLinedUp\_APF/multiRobots\_APF.py}
+    \item \texttt{APF\_WithBiasPF/multiRobots\_APF\_WithAdaptiveBias.py}
+    \item \texttt{Harmonic\_PF/multiRobots\_HPF.py}
+    \item (reference variant) \texttt{Harmonic\_PF/multiRobots\_HPF\_pure.py}
+    \item \texttt{Harmonic\_PF/harmonic\_field\_solver.py}
+\end{itemize}
+
+\end{document}
